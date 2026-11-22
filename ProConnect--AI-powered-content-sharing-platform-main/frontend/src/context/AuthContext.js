@@ -1,0 +1,409 @@
+"use client";
+
+import { createContext, useContext, useState, useEffect, useCallback } from "react";
+import { useRouter } from "next/navigation";
+import { useApi } from "@/hooks/useApi";
+import { useSession, signIn, signOut } from "next-auth/react";
+
+// Create auth context
+const AuthContext = createContext();
+
+// Auth provider component
+export const AuthProvider = ({ children }) => {
+  const { data: session, status } = useSession();
+  const [user, setUser] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+  const [lastVerified, setLastVerified] = useState(null);
+  const router = useRouter();
+
+  // Load cached user data on mount - but only if it matches current session
+  useEffect(() => {
+    // Don't load cache if we're not authenticated or session is loading
+    if (status === 'loading') return;
+    
+    // If not authenticated, clear any cached data
+    if (status === 'unauthenticated') {
+      try {
+        sessionStorage.removeItem('cachedUser');
+        sessionStorage.removeItem('cachedUserTimestamp');
+        sessionStorage.removeItem('cachedUserId');
+      } catch (e) {}
+      setUser(null);
+      setLoading(false);
+      return;
+    }
+    
+    try {
+      const cachedUser = sessionStorage.getItem('cachedUser');
+      const cachedTimestamp = sessionStorage.getItem('cachedUserTimestamp');
+      const cachedUserId = sessionStorage.getItem('cachedUserId');
+      
+      // Check if cached user matches current session user
+      const sessionUserId = session?.user?.id;
+      
+      if (cachedUser && cachedTimestamp && cachedUserId) {
+        const timestamp = parseInt(cachedTimestamp);
+        const now = Date.now();
+        
+        // Use cached data ONLY if:
+        // 1. It's less than 5 minutes old
+        // 2. The cached user ID matches the session user ID
+        if (now - timestamp < 300000 && (!sessionUserId || cachedUserId === sessionUserId)) {
+          setUser(JSON.parse(cachedUser));
+          setLastVerified(timestamp);
+          setLoading(false);
+          return;
+        }
+      }
+      
+      // Cache is invalid or doesn't match - clear it
+      sessionStorage.removeItem('cachedUser');
+      sessionStorage.removeItem('cachedUserTimestamp');
+      sessionStorage.removeItem('cachedUserId');
+    } catch (error) {
+      console.error('Error loading cached user data:', error);
+    }
+  }, [status, session?.user?.id]);
+
+  // Use the custom hook to get the API client
+  const api = useApi();
+
+  // Logout user
+  const logout = async () => {
+    try {
+      setLoading(true);
+      
+      // Clear local state immediately
+      setUser(null);
+      
+      // Clear all cached data
+      try {
+        sessionStorage.removeItem('cachedUser');
+        sessionStorage.removeItem('cachedUserTimestamp');
+        sessionStorage.removeItem('cachedUserId');
+        if (typeof window !== 'undefined') {
+          window.localStorage.removeItem('auth_token');
+          // Clear any other auth-related items
+          window.localStorage.clear();
+          sessionStorage.clear();
+        }
+      } catch (cacheError) {
+        console.error('Error clearing cached data:', cacheError);
+      }
+
+      // Try to logout from backend (don't block on failure)
+      try {
+        await api.post("/api/users/logout");
+      } catch (backendError) {
+        console.error('Backend logout error (non-blocking):', backendError);
+      }
+
+      // Sign out of NextAuth
+      await signOut({ callbackUrl: '/login', redirect: true });
+      
+      return { success: true };
+    } catch (err) {
+      console.error('Logout error:', err);
+      // Force redirect even on error
+      router.push("/login");
+      return { success: false, error: err.message };
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // Verify user with API, but rate limit to prevent too many calls
+  const verifyUser = useCallback(async (force = false) => {
+
+    // Never hit the backend when there is no NextAuth session
+    if (status === "unauthenticated") {
+      return;
+    }
+    
+    // Don't verify if we already have user data and session is valid, unless forced
+    if (!force && user && session && status === "authenticated") {
+      return;
+    }
+
+    // Rate limiting: don't verify more than once every 30 seconds unless forced
+    const now = Date.now();
+    if (!force && lastVerified && (now - lastVerified) < 30000) {
+      return;
+    }
+
+    // Only set loading to true if we don't have user data yet
+    const shouldSetLoading = !user;
+    if (shouldSetLoading) {
+      setLoading(true);
+    }
+
+    try {
+      const response = await api.get("/api/users/me");
+      const userData = response.data.data;
+      setUser(userData);
+      setLastVerified(now);
+      
+      // Cache user data in sessionStorage with user ID for validation
+      try {
+        sessionStorage.setItem('cachedUser', JSON.stringify(userData));
+        sessionStorage.setItem('cachedUserTimestamp', now.toString());
+        sessionStorage.setItem('cachedUserId', userData._id || userData.id);
+      } catch (cacheError) {
+        console.error('Error caching user data:', cacheError);
+      }
+    } catch (error) {
+      console.error("=== AUTH VERIFICATION ERROR ===");
+      console.error("Error details:", error);
+      console.error("Error response:", error.response?.data);
+      setUser(null);
+      
+      // If verification fails, it means the token is expired or invalid
+      // We'll handle the silent cleanup without redirecting
+      try {
+        await api.post("/api/users/logout");
+        // Only sign out of NextAuth if there is an active NextAuth session
+        if (status === "authenticated") {
+          await signOut({ redirect: false });
+        }
+      } catch (logoutError) {
+        console.error("Silent logout error:", logoutError);
+      }
+    } finally {
+      if (shouldSetLoading) {
+        setLoading(false);
+      }
+    }
+  }, [api, user, session, status, lastVerified]);
+
+  // Initialize from cache and session
+  useEffect(() => {
+    if (status === "loading") return;
+
+    // Don't attempt backend verification when NextAuth has no session
+    if (status === "unauthenticated") {
+      setLoading(false);
+      return;
+    }
+
+    if (!user) {
+      verifyUser();
+    } else {
+      setLoading(false);
+    }
+  }, [status, user, verifyUser]);
+
+  // Handle visibility change (tab switching) to prevent unnecessary re-fetching
+  useEffect(() => {
+    const handleVisibilityChange = () => {
+      // Only verify if the page becomes visible and we have a session but no user
+      // Also check if we haven't verified recently
+      const now = Date.now();
+      if (!document.hidden && status === "authenticated" && !user && 
+          (!lastVerified || (now - lastVerified) > 30000)) {
+        verifyUser();
+      }
+    };
+
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    return () => {
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+    };
+  }, [status, user, verifyUser, lastVerified]);
+
+  // Register a new user
+  const register = async (userData) => {
+    try {
+      setLoading(true);
+      setError(null);
+      const response = await api.post("/api/users/register", userData);
+      
+      // Set user data immediately
+      setUser(response.data.data);
+      try {
+        if (typeof window !== 'undefined' && response?.data?.data?.token) {
+          window.localStorage.setItem('auth_token', response.data.data.token);
+        }
+      } catch {}
+      
+      // Wait a bit for cookies to be set, then verify
+      setTimeout(async () => {
+        await verifyUser(true);
+      }, 100);
+      
+      return { success: true, data: response.data.data };
+    } catch (err) {
+      console.error("Registration error:", err);
+      const errorMessage = err.response?.data?.message || "Registration failed";
+      setError(errorMessage);
+      return { success: false, error: errorMessage };
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // Check if username or email exists
+  const checkUserExists = async (identifier) => {
+    try {
+      await api.post("/api/users/check-availability", identifier);
+      return { exists: false, message: "Available" };
+    } catch (err) {
+      const errorMessage = err.response?.data?.message || "Error checking availability";
+      return { exists: true, message: errorMessage };
+    }
+  };
+
+  // Login user via NextAuth Credentials to ensure session cookie on frontend domain
+  const login = async (credentials) => {
+    try {
+      setLoading(true);
+      setError(null);
+      
+      // Clear any cached user data from previous session BEFORE login
+      try {
+        sessionStorage.removeItem('cachedUser');
+        sessionStorage.removeItem('cachedUserTimestamp');
+        sessionStorage.removeItem('cachedUserId');
+        // Also clear localStorage token to prevent stale tokens
+        if (typeof window !== 'undefined') {
+          window.localStorage.removeItem('auth_token');
+        }
+        setUser(null);
+        setLastVerified(null);
+      } catch (e) {
+        console.error('Error clearing cache before login:', e);
+      }
+
+      console.log("🔐 Starting login process...");
+
+      const result = await signIn("credentials", {
+        redirect: false,
+        identifier: credentials.identifier,
+        password: credentials.password,
+      });
+
+      console.log("🔐 SignIn result:", result);
+
+      if (result?.error) {
+        const errorMessage = result.error === "CredentialsSignin" 
+          ? "Invalid email/username or password" 
+          : result.error;
+        setError(errorMessage);
+        return { success: false, error: errorMessage };
+      }
+
+      // NextAuth session now contains backendToken via jwt/session callbacks
+      // Give a longer delay for session to update
+      await new Promise((r) => setTimeout(r, 500));
+      
+      console.log("🔐 Login successful, verifying user...");
+      await verifyUser(true);
+      return { success: true };
+    } catch (err) {
+      console.error("🔐 Login error:", err);
+      const errorMessage = err?.message || "Login failed";
+      setError(errorMessage);
+      return { success: false, error: errorMessage };
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const googleLogin = async () => {
+    try {
+      setLoading(true);
+      
+      // Clear any cached user data from previous session BEFORE login
+      try {
+        sessionStorage.removeItem('cachedUser');
+        sessionStorage.removeItem('cachedUserTimestamp');
+        sessionStorage.removeItem('cachedUserId');
+        // Also clear localStorage token to prevent stale tokens
+        if (typeof window !== 'undefined') {
+          window.localStorage.removeItem('auth_token');
+        }
+        setUser(null);
+        setLastVerified(null);
+      } catch (e) {
+        console.error('Error clearing cache before Google login:', e);
+      }
+      
+      await signIn("google", { callbackUrl: "/feed" });
+    } catch (err) {
+      setError(err);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // Update user profile
+  const updateProfile = async (userId, profileData) => {
+    try {
+      setLoading(true);
+      setError(null);
+
+      const response = await api.patch(`/api/users/${userId}`, profileData);
+
+      // Update user state with the returned data
+      setUser(response.data.data);
+
+      // Fetch the latest user data to ensure we have the most up-to-date information
+      await verifyUser(true);
+
+      return { success: true, data: response.data.data };
+    } catch (err) {
+      const errorMessage = err.response?.data?.message || "Profile update failed";
+      setError(errorMessage);
+      return { success: false, error: errorMessage };
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // Update user password
+  const updatePassword = async (userId, passwordData) => {
+    try {
+      setLoading(true);
+      setError(null);
+
+      await api.patch(`/api/users/${userId}/password`, passwordData);
+
+      // Refresh user data after password update
+      await verifyUser(true);
+
+      return { success: true, message: "Password updated successfully" };
+    } catch (err) {
+      const errorMessage = err.response?.data?.message || "Password update failed";
+      setError(errorMessage);
+      return { success: false, error: errorMessage };
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const value = {
+    user,
+    loading,
+    error,
+    register,
+    login,
+    googleLogin,
+    logout,
+    checkUserExists,
+    updateProfile,
+    updatePassword,
+    isAuthenticated: !!user,
+    verifyUser,
+  };
+
+  return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
+};
+
+// Custom hook to use auth context
+export const useAuth = () => {
+  const context = useContext(AuthContext);
+  if (!context) {
+    throw new Error("useAuth must be used within an AuthProvider");
+  }
+  return context;
+}; 
